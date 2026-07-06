@@ -2,3 +2,18 @@
 __pycache__/
 *.pyc
 .env
+
+# Model and database directories
+vector_db/
+wms-ai-vector-db/
+wms_final_model/
+*.db
+*.sqlite
+wms-ai-reindex-queue.jsonl
+
+# Build and distribution files
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
+*.log
