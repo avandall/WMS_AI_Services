@@ -1,0 +1,22 @@
+# Constraints derived from the repo lockfile for the Unsloth fine-tuning stack.
+# This narrows the resolver without requiring every package in the full application lock.
+# Do not pin torch/triton/CUDA here. Kaggle's GPU image already provides a
+# compatible CUDA runtime, and forcing a Docker-style CUDA wheel set can break
+# bitsandbytes library loading.
+accelerate==1.13.0
+bitsandbytes==0.49.2
+cut-cross-entropy==25.1.1
+datasets==4.3.0
+hf-transfer==0.1.9
+huggingface-hub==1.11.0
+peft==0.19.1
+protobuf==6.33.6
+safetensors==0.7.0
+sentencepiece==0.2.1
+tokenizers==0.22.2
+torchao==0.17.0
+transformers==5.3.0
+trl==0.24.0
+tyro==1.0.13
+unsloth==2026.3.11
+unsloth-zoo==2026.3.6
