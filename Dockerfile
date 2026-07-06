@@ -8,19 +8,19 @@ ENV PATH="/app/.venv/bin:$PATH" \
 WORKDIR /app
 
 # Copy the AI Service package definition
-COPY WMS_AI_Services/pyproject.toml ./
+COPY pyproject.toml ./
 
-# Copy shared-utils from WMS_Core workspace
-COPY WMS_Core/Libraries/shared-utils ./Libraries/shared-utils
+# Copy shared-utils from nested submodule
+COPY Libraries/shared-utils ./Libraries/shared-utils
 
 # Copy source code files so hatchling can register package paths
-COPY WMS_AI_Services/src ./src
+COPY src ./src
 
 # Install virtualenv and package dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv && uv pip install -e .
 
 # Copy training models and scripts
-COPY WMS_AI_Services/training ./training
+COPY training ./training
 
 CMD ["ai-grpc"]
