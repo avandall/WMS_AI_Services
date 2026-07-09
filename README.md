@@ -1,70 +1,70 @@
-# AI Service
+# 🧠 WMS AI Services: Intelligent Warehouse Reasoning & RAG Engine
 
-AI / Knowledge Service chạy opt-in qua compose profile `ai`.
+WMS AI Services is an intelligent backend microservice designed for heavy Retrieval-Augmented Generation (RAG) queries, LangGraph-driven agent workflows, search index update pipelines, and query template fine-tuning. 
 
-Phạm vi:
-- AI engine, RAG, embeddings, agent logic
-- gRPC query endpoint + health/metrics HTTP endpoint
-- Event-driven reindex queue từ domain events hoặc projection snapshots
+This service runs as an opt-in component in the ecosystem, managed via the `ai` Docker Compose profile.
 
-Runtime mặc định của dự án không build/start service này. Khi cần AI:
+---
 
-```bash
-docker compose --profile ai up -d ai-service
-```
+## 🛠️ Technology Stack
 
-Pipeline boundary:
+- **Frameworks**: LangGraph, LangChain, FastAPI (for HTTP metrics/health)
+- **Vector Search & Embedding**: ChromaDB, BM25 retriever, HuggingFace (`all-MiniLM-L6-v2`)
+- **LLM Integrations**: Groq API, OpenAI API
+- **Fine-Tuning**: PyTorch, HuggingFace Transformers, LoRA / PEFT
+- **Communication Protocol**: gRPC (for microservice orchestration), HTTP (for observability)
 
-- `ai_service.pipeline.ingestion`: đổi event envelope/snapshot thành reindex job.
-- `ai_service.pipeline.indexing`: queue adapter AI-owned cho reindex job.
-- `ai_service.pipeline.retrieval`: boundary cho retrieval context.
-- `ai_service.pipeline.routing`: phân loại prompt thành knowledge/RAG hoặc data query.
-- `ai_service.pipeline.templates`: đổi data query thành object template key-value. Mặc định dùng
-  Groq qua `GroqQueryTemplateExtractor`; có thể thay bằng local fine-tuned model khi set
-  `FINE_TUNED_MODEL_PATH`, hoặc tự cài extractor khác qua `QueryTemplateExtractor`.
-- `ai_service.pipeline.backend_query`: boundary gửi template sang backend sở hữu truy vấn dữ liệu.
-- `ai_service.pipeline.generation`: query pipeline điều phối router, RAG, template extraction, và
-  backend query.
-- `ai_service.pipeline.providers`: adapter vào RAG/LLM engine nặng.
+---
 
-AI không đọc database vận hành của service khác; dữ liệu vào phải đến từ event hoặc read-model
-snapshot có thể replay.
+## 🧭 Ingestion & Processing Pipeline
 
-Query flow:
+The service codebase is organized into modular pipeline boundaries:
 
-1. Client gọi gRPC `Query` của `wms.ai.v1.AIService` với `mode=auto` mặc định.
-2. Router kiểm tra prompt có phải data/SQL/DB-style query không.
-3. Knowledge prompt đi qua RAG workflow, dùng LLM API và quality evaluator/critic.
-4. Data prompt đi qua template extractor để tạo object key-value, rồi chuyển object đó cho
-   backend query adapter. Nếu cấu hình `AI_BACKEND_QUERY_URL`, adapter sẽ POST template sang
-   backend; nếu chưa cấu hình, response trả về template đã chuẩn bị để giữ boundary sạch.
-5. HTTP chỉ dùng cho `GET /health` và `GET /metrics`.
+- `ai_service.pipeline.ingestion` — Translates incoming domain events or projection snapshots into indexing jobs.
+- `ai_service.pipeline.indexing` — Queue adapter that indexes processed data blocks into vector databases.
+- `ai_service.pipeline.retrieval` — Retrieval context boundary, performing Hybrid Search (Vector similarity + Keyword search).
+- `ai_service.pipeline.routing` — Classifies prompts into knowledge queries (RAG-based) or operational data queries.
+- `ai_service.pipeline.templates` — Extracts parameters from unstructured data queries into standardized JSON templates. Defaults to `GroqQueryTemplateExtractor` or uses a local fine-tuned model.
+- `ai_service.pipeline.backend_query` — Routes extracted JSON templates to the parent `api-gateway` to query operational databases securely.
+- `ai_service.pipeline.generation` — Coordinates the end-to-end query workflow (Router -> RAG/Template Extraction -> Context Synthesis).
+- `ai_service.pipeline.providers` — Adapters and clients for external LLM engines.
 
-Fine-tuned local model, nếu bật, chỉ thay extractor ở bước 4. Nó không chạm vào RAG/agent path
-và không thay đổi flow knowledge prompt.
+> [!IMPORTANT]
+> To preserve domain boundaries, the AI Service never queries operational databases directly. It only ingests streaming events and read-model snapshots to rebuild vector search representations asynchronously.
 
-Fine-tune workflow:
+---
+
+## 🔄 Query Execution Flow
+
+1. **Client Call**: A client initiates a request via the gRPC `Query` endpoint defined on `wms.ai.v1.AIService`.
+2. **Query Routing**: The router classifies the prompt to determine whether it is a semantic knowledge question or an operational database query.
+3. **Knowledge Path (RAG)**: The prompt passes through a RAG workflow, fetching context using hybrid retrieval, generating responses via LLM, and verifying accuracy.
+4. **Data Path (Template Extraction)**: The prompt is passed to the extractor to generate a JSON structure (`{intent, target, filters, metrics}`). If `AI_BACKEND_QUERY_URL` is configured, the adapter posts the template to the gateway for execution; otherwise, it returns the structured query to the client to ensure boundaries remain clean.
+5. **Observability**: Health checks and metrics are exposed over HTTP via `GET /health` and `GET /metrics`.
+
+---
+
+## 🏋️ Fine-Tuning Workflow
+
+To enable local query template extraction without relying on external LLM APIs, you can train a local Small Language Model (SLM) using the LoRA script:
 
 ```bash
 uv run python training/fine_tuning/train_wms.py
 ```
 
-Script train dùng cùng prompt JSON template với runtime extractor, tự chuyển dataset SQL hiện tại
-thành template có `intent`, `target`, `filters`, `metrics`, `limit`, và `sql`. Artifact mặc định:
+### Dataset & Artifacts
+- `training/fine_tuning/data/wms_data_enriched.jsonl` — Multi-domain WMS dataset containing English and Vietnamese paraphrased queries.
+- `training/fine_tuning/build_enriched_dataset.py` — Generator utility script to compile or expand the training datasets.
+- `training/fine_tuning/wms_final_adapter` — LoRA / PEFT adapter weights.
+- `training/fine_tuning/wms_final_model` — Merged final model ready for inference.
 
-- `training/fine_tuning/data/wms_data_enriched.jsonl`: dataset mặc định, đa domain WMS và có
-  paraphrase tiếng Việt/Anh.
-- `training/fine_tuning/build_enriched_dataset.py`: generator để tái tạo hoặc mở rộng dataset.
+### Inference Configuration
+Once the model is fine-tuned, configure runtime variables in your service environment file:
 
-- `training/fine_tuning/wms_final_adapter`: LoRA/PEFT adapter.
-- `training/fine_tuning/wms_final_model`: merged model, dùng thuận tiện nhất cho runtime.
-
-Sau khi train xong, set:
-
-```bash
+```env
 FINE_TUNED_MODEL_PATH=training/fine_tuning/wms_final_model
 FINE_TUNED_MODEL_DEVICE=cpu
 ```
 
-Nếu chỉ muốn dùng adapter, trỏ `FINE_TUNED_MODEL_PATH` vào `wms_final_adapter`; runtime cũng hỗ trợ
-PEFT adapter folder có `adapter_config.json`.
+> [!TIP]
+> The runtime also supports PEFT folders containing `adapter_config.json`. Simply point `FINE_TUNED_MODEL_PATH` directly to `training/fine_tuning/wms_final_adapter`.
