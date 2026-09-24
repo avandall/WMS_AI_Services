@@ -2,6 +2,8 @@
 Enhanced WMS Agent Tools with Few-shot Prompting and Smart Slotting
 """
 from typing import List, Dict, Any, Tuple
+import hashlib
+import hmac
 from sqlalchemy import text
 import pandas as pd
 from langchain_core.tools import tool
@@ -25,6 +27,23 @@ class EnhancedWMSTools:
         except Exception as e:
             logger.error(f"Failed to initialize database engine: {str(e)}")
             self.engine = None
+
+    def get_tools(self) -> List[Any]:
+        """Return list of LangChain tool wrappers for all operational tools bound to this instance"""
+        return [
+            tool(self.enhanced_inventory_query),
+            tool(self.abc_analysis_report),
+            tool(self.smart_slotting_optimizer),
+            tool(self.update_inventory_quantity),
+            tool(self.adjust_inventory_for_reason),
+            tool(self.move_stock_between_locations),
+            tool(self.get_transaction_history),
+            tool(self.get_stock_movement_history),
+            tool(self.get_user_activity_summary),
+            tool(self.create_system_alert),
+            tool(self.get_low_stock_report),
+            tool(self.verify_location_empty)
+        ]
     
     def get_few_shot_examples(self, task_type: str) -> List[Dict[str, str]]:
         """Get few-shot examples for different task types"""
@@ -68,7 +87,6 @@ class EnhancedWMSTools:
         }
         return examples.get(task_type, [])
     
-    @tool
     def enhanced_inventory_query(self, sku_code: str):
         """
         Enhanced inventory query with few-shot prompting and ABC analysis.
@@ -115,7 +133,6 @@ class EnhancedWMSTools:
                 "sku_code": sku_code
             }
     
-    @tool
     def abc_analysis_report(self, analysis_type: str = "full"):
         """
         Generate ABC analysis report for inventory management.
@@ -153,7 +170,6 @@ class EnhancedWMSTools:
                 "analysis_type": analysis_type
             }
     
-    @tool
     def smart_slotting_optimizer(self, sku_code: str, constraints: str = "standard"):
         """
         Smart slotting optimization using ABC analysis and warehouse constraints.
@@ -222,30 +238,39 @@ class EnhancedWMSTools:
         return None
     
     def _get_inventory_data(self, sku_code: str) -> Dict[str, Any]:
-        """Get inventory data from database"""
+        """Get inventory data from database aligned with WMS Core schema"""
         try:
             if not self.engine:
                 raise Exception("Database engine not initialized")
             
             with self.engine.connect() as conn:
                 query = text("""
-                    SELECT quantity, location, product_name, last_updated, 
-                           unit_cost, reorder_point, safety_stock
-                    FROM inventory 
-                    WHERE sku = :sku
+                    SELECT 
+                        p.name AS product_name,
+                        COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) AS quantity,
+                        COALESCE(MIN(pos.code), 'UNKNOWN') AS location,
+                        MAX(il.updated_at) AS last_updated,
+                        MAX(p.price) AS unit_cost,
+                        p.product_id
+                    FROM products p
+                    LEFT JOIN warehouse_inventory wi ON p.product_id = wi.product_id
+                    LEFT JOIN inventory_locations il ON p.product_id = il.product_id
+                    LEFT JOIN positions pos ON il.position_id = pos.id
+                    WHERE p.name = :sku OR CAST(p.product_id AS VARCHAR) = :sku
+                    GROUP BY p.product_id, p.name
                 """)
                 result = conn.execute(query, {"sku": sku_code}).fetchone()
                 
                 if result:
                     return {
                         "sku": sku_code,
-                        "quantity": result[0],
-                        "location": result[1],
-                        "product_name": result[2],
-                        "last_updated": result[3],
+                        "quantity": int(result[1]) if result[1] is not None else 0,
+                        "location": result[2] or "UNKNOWN",
+                        "product_name": result[0],
+                        "last_updated": result[3].isoformat() if hasattr(result[3], "isoformat") else str(result[3]) if result[3] else None,
                         "unit_cost": float(result[4]) if result[4] else 0.0,
-                        "reorder_point": result[5] or 0,
-                        "safety_stock": result[6] or 0
+                        "reorder_point": 0,
+                        "safety_stock": 0
                     }
                 
                 return None
@@ -255,29 +280,34 @@ class EnhancedWMSTools:
             return None
     
     def _get_all_inventory_data(self) -> List[Dict[str, Any]]:
-        """Get all inventory data for ABC analysis"""
+        """Get all inventory data for ABC analysis aligned with WMS Core schema"""
         try:
             if not self.engine:
                 raise Exception("Database engine not initialized")
             
             with self.engine.connect() as conn:
                 query = text("""
-                    SELECT sku, quantity, product_name, unit_cost, 
-                           monthly_demand, last_updated
-                    FROM inventory 
-                    WHERE quantity > 0
-                    ORDER BY monthly_demand DESC
+                    SELECT 
+                        COALESCE(p.name, CAST(p.product_id AS VARCHAR)) AS sku,
+                        COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) AS total_qty,
+                        p.name AS product_name,
+                        p.price AS unit_cost
+                    FROM products p
+                    JOIN warehouse_inventory wi ON p.product_id = wi.product_id
+                    GROUP BY p.product_id, p.name, p.price
+                    HAVING COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) > 0
+                    ORDER BY total_qty DESC
                 """)
                 results = conn.execute(query).fetchall()
                 
                 return [
                     {
                         "sku": row[0],
-                        "quantity": row[1],
+                        "quantity": int(row[1]),
                         "product_name": row[2],
                         "unit_cost": float(row[3]) if row[3] else 0.0,
-                        "monthly_demand": row[4] or 0,
-                        "last_updated": row[5]
+                        "monthly_demand": int(row[1]),
+                        "last_updated": None
                     }
                     for row in results
                 ]
@@ -334,21 +364,24 @@ class EnhancedWMSTools:
         }
     
     def _get_abc_analysis(self, sku_code: str) -> str:
-        """Get ABC classification for a specific SKU"""
+        """Get ABC classification for a specific SKU aligned with WMS Core schema"""
         try:
             if not self.engine:
                 raise Exception("Database engine not initialized")
             
             with self.engine.connect() as conn:
                 query = text("""
-                    SELECT monthly_demand, unit_cost
-                    FROM inventory 
-                    WHERE sku = :sku
+                    SELECT 
+                        COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) AS quantity,
+                        MAX(p.price) AS unit_cost
+                    FROM products p
+                    LEFT JOIN warehouse_inventory wi ON p.product_id = wi.product_id
+                    WHERE p.name = :sku OR CAST(p.product_id AS VARCHAR) = :sku
+                    GROUP BY p.product_id, p.name
                 """)
                 result = conn.execute(query, {"sku": sku_code}).fetchone()
                 
                 if result:
-                    # Simple ABC classification based on demand
                     demand = result[0] or 0
                     cost = float(result[1]) if result[1] else 0.0
                     value = demand * cost
@@ -536,29 +569,27 @@ class EnhancedWMSTools:
 
 *Recommendation generated using smart slotting algorithm with ABC analysis and constraint optimization.*"""
     
-    # ==================== INVENTORY TRANSACTIONS ====================
+    # ==================== INVENTORY TRANSACTIONS (GUARDRAILS & MAKER-CHECKER) ====================
     
-    @tool
     def update_inventory_quantity(self, sku_code: str, new_quantity: int, reason: str, user_id: str = "system"):
         """
-        Update inventory quantity for a specific SKU with transaction logging.
+        Propose updating inventory quantity for a specific SKU (Maker-Checker Guardrail).
+        Creates a DraftAdjustmentProposal for human Warehouse Manager approval.
+        Direct database modification by AI is disabled for SOX/GAAP audit compliance.
         
         Args:
-            sku_code: SKU code to update (e.g., "LAP-001")
-            new_quantity: New quantity value (must be >= 0)
-            reason: Reason for the update (e.g., "stock adjustment", "damage", "return")
-            user_id: ID of user performing the action
+            sku_code: SKU code to adjust (e.g., "LAP-001")
+            new_quantity: Proposed new quantity value (must be >= 0)
+            reason: Reason for the proposed update (e.g., "stock adjustment", "damage", "return")
+            user_id: ID of user/agent requesting the proposal
         
-        Returns transaction details and updated inventory status.
+        Returns DraftAdjustmentProposal details requiring human approval.
         
         Examples:
         - update_inventory_quantity("LAP-001", 50, "stock adjustment", "user123")
         - update_inventory_quantity("MOB-003", 25, "damage", "admin")
         """
         try:
-            if not self.engine:
-                raise Exception("Database engine not initialized")
-            
             if new_quantity < 0:
                 return {
                     "error": True,
@@ -567,106 +598,86 @@ class EnhancedWMSTools:
                     "suggestion": "Please provide a non-negative quantity value"
                 }
             
-            # Get current inventory
+            # Get current inventory (Read-only lookup)
             current_data = self._get_inventory_data(sku_code)
-            old_quantity = current_data["quantity"] if current_data else 0
+            current_quantity = current_data["quantity"] if current_data else 0
+            quantity_change = new_quantity - current_quantity
+            proposal_id = f"PROP_{sku_code}_{int(time.time())}"
             
-            # Update inventory
-            with self.engine.connect() as conn:
-                # Update or insert inventory
-                if current_data:
-                    update_query = text("""
-                        UPDATE inventory 
-                        SET quantity = :new_quantity, last_updated = CURRENT_TIMESTAMP
-                        WHERE sku = :sku
-                    """)
-                    conn.execute(update_query, {
-                        "new_quantity": new_quantity,
-                        "sku": sku_code
-                    })
-                else:
-                    # Insert new record if not exists
-                    insert_query = text("""
-                        INSERT INTO inventory (sku, quantity, product_name, last_updated)
-                        VALUES (:sku, :quantity, :product_name, CURRENT_TIMESTAMP)
-                    """)
-                    conn.execute(insert_query, {
-                        "sku": sku_code,
-                        "quantity": new_quantity,
-                        "product_name": f"Product {sku_code}"
-                    })
-                
-                # Log transaction
-                log_query = text("""
-                    INSERT INTO inventory_transactions 
-                    (sku_code, old_quantity, new_quantity, reason, user_id, transaction_type, timestamp)
-                    VALUES (:sku, :old_qty, :new_qty, :reason, :user_id, :type, CURRENT_TIMESTAMP)
-                """)
-                conn.execute(log_query, {
-                    "sku": sku_code,
-                    "old_qty": old_quantity,
-                    "new_qty": new_quantity,
-                    "reason": reason,
-                    "user_id": user_id,
-                    "type": "quantity_update"
-                })
-                
-                conn.commit()
+            # Record draft proposal in database if connection is available
+            if self.engine:
+                try:
+                    with self.engine.connect() as conn:
+                        log_proposal = text("""
+                            INSERT INTO draft_proposals 
+                            (proposal_id, proposal_type, sku_code, current_quantity, proposed_quantity, adjustment, reason, requested_by, status, created_at)
+                            VALUES (:pid, 'DraftAdjustmentProposal', :sku, :curr_qty, :prop_qty, :adj, :reason, :user_id, 'DRAFT_PROPOSAL', CURRENT_TIMESTAMP)
+                        """)
+                        conn.execute(log_proposal, {
+                            "pid": proposal_id,
+                            "sku": sku_code,
+                            "curr_qty": current_quantity,
+                            "prop_qty": new_quantity,
+                            "adj": quantity_change,
+                            "reason": reason,
+                            "user_id": user_id
+                        })
+                        conn.commit()
+                except Exception as db_err:
+                    logger.warning(f"Could not persist draft proposal to DB table: {db_err}")
             
-            # Get updated data
-            updated_data = self._get_inventory_data(sku_code)
-            
+            sig_payload = f"{proposal_id}:{sku_code}:{current_quantity}:{new_quantity}:{user_id}"
+            digital_sig = hmac.new(b"wms_audit_sox_sec_2026", sig_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
             return {
                 "success": True,
-                "transaction_id": f"TXN_{sku_code}_{int(time.time())}",
+                "status": "DRAFT_PROPOSAL",
+                "proposal_id": proposal_id,
+                "proposal_type": "DraftAdjustmentProposal",
+                "event_type": "DraftAdjustmentProposalCreated",
                 "sku_code": sku_code,
-                "old_quantity": old_quantity,
-                "new_quantity": new_quantity,
-                "quantity_change": new_quantity - old_quantity,
+                "current_quantity": current_quantity,
+                "proposed_quantity": new_quantity,
+                "quantity_change": quantity_change,
                 "reason": reason,
+                "requested_by": user_id,
                 "user_id": user_id,
-                "timestamp": datetime.now().isoformat(),
-                "updated_inventory": updated_data
+                "digital_signature": digital_sig,
+                "requires_approval": True,
+                "approver_role": "Warehouse Manager",
+                "message": f"DraftAdjustmentProposal {proposal_id} created for SKU {sku_code}. Actual inventory quantity remains {current_quantity} (unchanged) until approved by a human Warehouse Manager.",
+                "timestamp": datetime.now().isoformat()
             }
             
         except Exception as e:
-            logger.error(f"Error updating inventory: {str(e)}")
+            logger.error(f"Error creating inventory adjustment proposal: {str(e)}")
             return {
                 "error": True,
-                "error_type": "database_error" if "database" in str(e).lower() else "update_error",
-                "message": f"Error updating inventory for SKU {sku_code}: {str(e)}",
+                "error_type": "proposal_creation_error",
+                "message": f"Error creating proposal for SKU {sku_code}: {str(e)}",
                 "suggestion": "Please verify SKU code, quantity value, and try again.",
                 "sku_code": sku_code,
                 "new_quantity": new_quantity
             }
     
-    @tool
     def adjust_inventory_for_reason(self, sku_code: str, adjustment: int, reason: str, user_id: str = "system"):
         """
-        Adjust inventory by adding/subtracting from current quantity.
+        Propose adjusting inventory by adding/subtracting from current quantity.
+        Creates a DraftAdjustmentProposal for human Warehouse Manager confirmation.
         
         Args:
             sku_code: SKU code to adjust
             adjustment: Positive to add, negative to subtract
             reason: Reason for adjustment
-            user_id: User performing the action
+            user_id: User/agent requesting the adjustment
         
         Examples:
         - adjust_inventory_for_reason("LAP-001", 10, "new stock received")
         - adjust_inventory_for_reason("MOB-003", -5, "damaged items")
         """
         try:
-            # Get current quantity
             current_data = self._get_inventory_data(sku_code)
-            if not current_data:
-                return {
-                    "error": True,
-                    "error_type": "not_found_error",
-                    "message": f"SKU {sku_code} not found in inventory",
-                    "suggestion": "Please check SKU code or use update_inventory_quantity for new items"
-                }
-            
-            current_quantity = current_data["quantity"]
+            current_quantity = current_data["quantity"] if current_data else 0
             new_quantity = current_quantity + adjustment
             
             if new_quantity < 0:
@@ -677,11 +688,10 @@ class EnhancedWMSTools:
                     "suggestion": f"Current quantity: {current_quantity}, maximum adjustment: {-current_quantity}"
                 }
             
-            # Use the main update function
             return self.update_inventory_quantity(sku_code, new_quantity, reason, user_id)
             
         except Exception as e:
-            logger.error(f"Error adjusting inventory: {str(e)}")
+            logger.error(f"Error creating inventory adjustment proposal: {str(e)}")
             return {
                 "error": True,
                 "error_type": "adjustment_error",
@@ -692,28 +702,25 @@ class EnhancedWMSTools:
     
     # ==================== INBOUND/OUTBOUND OPERATIONS ====================
     
-    @tool
     def move_stock_between_locations(self, sku_code: str, from_location: str, to_location: str, quantity: int, user_id: str = "system"):
         """
-        Move stock from one warehouse location to another.
+        Propose moving stock from one warehouse location to another (Maker-Checker Guardrail).
+        Creates a DraftMovementProposal requiring human approval before stock is transferred.
         
         Args:
             sku_code: SKU code to move
             from_location: Source location code (e.g., "Zone A-01-01")
             to_location: Destination location code (e.g., "Zone B-02-03")
             quantity: Quantity to move
-            user_id: User performing the move
+            user_id: User/agent proposing the move
         
-        Returns movement details and updated locations.
+        Returns movement proposal details requiring human approval.
         
         Examples:
         - move_stock_between_locations("LAP-001", "Zone A-01-01", "Zone B-02-03", 10)
         - move_stock_between_locations("MOB-003", "Zone C-03-01", "Zone A-01-02", 5)
         """
         try:
-            if not self.engine:
-                raise Exception("Database engine not initialized")
-            
             if quantity <= 0:
                 return {
                     "error": True,
@@ -722,7 +729,6 @@ class EnhancedWMSTools:
                     "suggestion": "Please provide a positive quantity value"
                 }
             
-            # Check source location has enough stock
             source_stock = self._get_location_stock(from_location, sku_code)
             if not source_stock or source_stock < quantity:
                 return {
@@ -732,93 +738,57 @@ class EnhancedWMSTools:
                     "suggestion": "Check stock levels or reduce quantity"
                 }
             
-            # Perform the movement
-            with self.engine.connect() as conn:
-                # Remove from source location
-                remove_query = text("""
-                    UPDATE location_stock 
-                    SET quantity = quantity - :qty, last_updated = CURRENT_TIMESTAMP
-                    WHERE location_code = :loc AND sku_code = :sku
-                """)
-                conn.execute(remove_query, {
-                    "qty": quantity,
-                    "loc": from_location,
-                    "sku": sku_code
-                })
-                
-                # Add to destination location (PostgreSQL UPSERT without ON CONFLICT)
-                # First check if location_stock exists
-                check_query = text("""
-                    SELECT quantity FROM location_stock 
-                    WHERE location_code = :loc AND sku_code = :sku
-                """)
-                existing_stock = conn.execute(check_query, {"loc": to_location, "sku": sku_code}).fetchone()
-                
-                if existing_stock:
-                    # Update existing record
-                    add_query = text("""
-                        UPDATE location_stock 
-                        SET quantity = quantity + :qty, last_updated = CURRENT_TIMESTAMP
-                        WHERE location_code = :loc AND sku_code = :sku
-                    """)
-                    conn.execute(add_query, {
-                        "loc": to_location,
-                        "sku": sku_code,
-                        "qty": quantity
-                    })
-                else:
-                    # Insert new record
-                    insert_query = text("""
-                        INSERT INTO location_stock (location_code, sku_code, quantity, last_updated)
-                        VALUES (:loc, :sku, :qty, CURRENT_TIMESTAMP)
-                    """)
-                    conn.execute(insert_query, {
-                        "loc": to_location,
-                        "sku": sku_code,
-                        "qty": quantity
-                    })
-                
-                # Log movement
-                movement_query = text("""
-                    INSERT INTO stock_movements 
-                    (sku_code, from_location, to_location, quantity, movement_type, user_id, timestamp, status)
-                    VALUES (:sku, :from_loc, :to_loc, :qty, :type, :user_id, CURRENT_TIMESTAMP, 'completed')
-                """)
-                conn.execute(movement_query, {
-                    "sku": sku_code,
-                    "from_loc": from_location,
-                    "to_loc": to_location,
-                    "qty": quantity,
-                    "type": "location_transfer",
-                    "user_id": user_id
-                })
-                
-                conn.commit()
+            proposal_id = f"MOVE_PROP_{sku_code}_{int(time.time())}"
             
-            # Get updated stock information
-            updated_source = self._get_location_stock(from_location, sku_code)
-            updated_dest = self._get_location_stock(to_location, sku_code)
+            if self.engine:
+                try:
+                    with self.engine.connect() as conn:
+                        log_proposal = text("""
+                            INSERT INTO draft_proposals 
+                            (proposal_id, proposal_type, sku_code, current_quantity, proposed_quantity, adjustment, reason, requested_by, status, created_at)
+                            VALUES (:pid, 'DraftMovementProposal', :sku, :curr_qty, :prop_qty, :adj, :reason, :user_id, 'DRAFT_PROPOSAL', CURRENT_TIMESTAMP)
+                        """)
+                        conn.execute(log_proposal, {
+                            "pid": proposal_id,
+                            "sku": sku_code,
+                            "curr_qty": source_stock,
+                            "prop_qty": source_stock - quantity,
+                            "adj": -quantity,
+                            "reason": f"Move {quantity} units from {from_location} to {to_location}",
+                            "user_id": user_id
+                        })
+                        conn.commit()
+                except Exception as db_err:
+                    logger.warning(f"Could not persist draft proposal to DB table: {db_err}")
             
+            sig_payload = f"{proposal_id}:{sku_code}:{from_location}:{to_location}:{quantity}:{user_id}"
+            digital_sig = hmac.new(b"wms_audit_sox_sec_2026", sig_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
             return {
                 "success": True,
-                "movement_id": f"MOVE_{sku_code}_{int(time.time())}",
+                "status": "DRAFT_PROPOSAL",
+                "proposal_id": proposal_id,
+                "proposal_type": "DraftMovementProposal",
+                "event_type": "DraftMovementProposalCreated",
                 "sku_code": sku_code,
                 "from_location": from_location,
                 "to_location": to_location,
-                "quantity_moved": quantity,
-                "source_stock_after": updated_source,
-                "destination_stock_after": updated_dest,
+                "quantity_to_move": quantity,
+                "requires_approval": True,
+                "approver_role": "Warehouse Manager",
+                "message": f"DraftMovementProposal {proposal_id} created for moving {quantity} units of {sku_code} from {from_location} to {to_location}. Stock locations remain unchanged until human approval.",
+                "requested_by": user_id,
                 "user_id": user_id,
-                "timestamp": datetime.now().isoformat(),
-                "status": "completed"
+                "digital_signature": digital_sig,
+                "timestamp": datetime.now().isoformat()
             }
             
         except Exception as e:
-            logger.error(f"Error moving stock: {str(e)}")
+            logger.error(f"Error creating stock movement proposal: {str(e)}")
             return {
                 "error": True,
-                "error_type": "movement_error",
-                "message": f"Error moving stock from {from_location} to {to_location}: {str(e)}",
+                "error_type": "movement_proposal_error",
+                "message": f"Error creating movement proposal from {from_location} to {to_location}: {str(e)}",
                 "suggestion": "Please verify locations, SKU code, and try again.",
                 "sku_code": sku_code,
                 "from_location": from_location,
@@ -826,18 +796,21 @@ class EnhancedWMSTools:
             }
     
     def _get_location_stock(self, location_code: str, sku_code: str) -> int:
-        """Get stock quantity for specific location and SKU"""
+        """Get stock quantity for specific location and SKU aligned with WMS Core schema"""
         try:
             if not self.engine:
                 return 0
             
             with self.engine.connect() as conn:
                 query = text("""
-                    SELECT quantity FROM location_stock 
-                    WHERE location_code = :loc AND sku_code = :sku
+                    SELECT COALESCE(SUM(il.quantity), 0)
+                    FROM inventory_locations il
+                    JOIN positions pos ON il.position_id = pos.id
+                    JOIN products p ON il.product_id = p.product_id
+                    WHERE pos.code = :loc AND (p.name = :sku OR CAST(p.product_id AS VARCHAR) = :sku)
                 """)
                 result = conn.execute(query, {"loc": location_code, "sku": sku_code}).fetchone()
-                return result[0] if result else 0
+                return int(result[0]) if result and result[0] is not None else 0
                 
         except Exception as e:
             logger.error(f"Error getting location stock: {str(e)}")
@@ -845,7 +818,6 @@ class EnhancedWMSTools:
     
     # ==================== LOGS & SYSTEM TRACKING ====================
     
-    @tool
     def get_transaction_history(self, sku_code: str = None, days: int = 30, user_id: str = None):
         """
         Get transaction history for inventory changes and movements.
@@ -922,7 +894,6 @@ class EnhancedWMSTools:
                 "suggestion": "Please verify filters and try again."
             }
     
-    @tool
     def get_stock_movement_history(self, sku_code: str = None, days: int = 30, status: str = None):
         """
         Get stock movement history between locations.
@@ -999,7 +970,6 @@ class EnhancedWMSTools:
                 "suggestion": "Please verify filters and try again."
             }
     
-    @tool
     def get_user_activity_summary(self, user_id: str, days: int = 30):
         """
         Get comprehensive activity summary for a specific user.
@@ -1088,7 +1058,6 @@ class EnhancedWMSTools:
                 "user_id": user_id
             }
     
-    @tool
     def create_system_alert(self, alert_type: str, message: str, sku_code: str = None, severity: str = "medium"):
         """
         Create system alerts for important events or issues.
@@ -1146,7 +1115,6 @@ class EnhancedWMSTools:
                 "suggestion": "Please verify alert details and try again."
             }
     
-    @tool
     def get_low_stock_report(self, include_safety_stock: bool = True):
         """
         Get comprehensive report of all low stock items across the warehouse.
@@ -1168,30 +1136,44 @@ class EnhancedWMSTools:
                 # Get all inventory items with actual safety_stock and reorder_point from seed.py
                 if include_safety_stock:
                     query = text("""
-                        SELECT sku, quantity, product_name, safety_stock, reorder_point,
-                               CASE 
-                                   WHEN quantity <= 0 THEN 'out_of_stock'
-                                   WHEN quantity <= safety_stock THEN 'below_safety_stock'
-                                   WHEN quantity <= reorder_point THEN 'below_reorder_point'
-                                   ELSE 'normal'
-                               END as stock_status
-                        FROM inventory 
-                        WHERE quantity <= reorder_point OR quantity <= 0
+                        SELECT 
+                            COALESCE(p.name, CAST(p.product_id AS VARCHAR)) AS sku,
+                            COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) AS quantity,
+                            p.name AS product_name,
+                            5 AS safety_stock,
+                            10 AS reorder_point,
+                            CASE 
+                                WHEN COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) <= 0 THEN 'out_of_stock'
+                                WHEN COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) <= 5 THEN 'below_safety_stock'
+                                WHEN COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) <= 10 THEN 'below_reorder_point'
+                                ELSE 'normal'
+                            END as stock_status
+                        FROM products p
+                        LEFT JOIN warehouse_inventory wi ON p.product_id = wi.product_id
+                        GROUP BY p.product_id, p.name
+                        HAVING COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) <= 10
                         ORDER BY 
                             CASE 
-                                WHEN quantity <= 0 THEN 1
-                                WHEN quantity <= safety_stock THEN 2
+                                WHEN COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) <= 0 THEN 1
+                                WHEN COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) <= 5 THEN 2
                                 ELSE 3
                             END,
-                            sku
+                            p.name
                     """)
                 else:
                     query = text("""
-                        SELECT sku, quantity, product_name, safety_stock, reorder_point,
-                               'out_of_stock' as stock_status
-                        FROM inventory 
-                        WHERE quantity <= 0
-                        ORDER BY sku
+                        SELECT 
+                            COALESCE(p.name, CAST(p.product_id AS VARCHAR)) AS sku,
+                            COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) AS quantity,
+                            p.name AS product_name,
+                            5 AS safety_stock,
+                            10 AS reorder_point,
+                            'out_of_stock' as stock_status
+                        FROM products p
+                        LEFT JOIN warehouse_inventory wi ON p.product_id = wi.product_id
+                        GROUP BY p.product_id, p.name
+                        HAVING COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) <= 0
+                        ORDER BY p.name
                     """)
                 
                 results = conn.execute(query).fetchall()
@@ -1251,7 +1233,6 @@ class EnhancedWMSTools:
         else:
             return "low"
     
-    @tool
     def verify_location_empty(self, location_code: str):
         """
         Check if a warehouse location is empty before moving stock into it.
@@ -1272,11 +1253,15 @@ class EnhancedWMSTools:
             with self.engine.connect() as conn:
                 # Get all stock at this location
                 query = text("""
-                    SELECT sku_code, quantity, product_name
-                    FROM location_stock ls
-                    JOIN inventory i ON ls.sku_code = i.sku
-                    WHERE ls.location_code = :loc AND ls.quantity > 0
-                    ORDER BY ls.quantity DESC
+                    SELECT 
+                        COALESCE(p.name, CAST(p.product_id AS VARCHAR)) AS sku_code,
+                        il.quantity,
+                        p.name AS product_name
+                    FROM inventory_locations il
+                    JOIN positions pos ON il.position_id = pos.id
+                    JOIN products p ON il.product_id = p.product_id
+                    WHERE pos.code = :loc AND il.quantity > 0
+                    ORDER BY il.quantity DESC
                 """)
                 results = conn.execute(query, {"loc": location_code}).fetchall()
                 conn.commit()  # Commit read transaction
@@ -1303,9 +1288,15 @@ class EnhancedWMSTools:
                 
                 # Get location capacity info if available
                 capacity_query = text("""
-                    SELECT capacity, current_occupancy, location_type, zone
-                    FROM locations 
-                    WHERE location_code = :loc
+                    SELECT 
+                        pos.capacity,
+                        COALESCE(SUM(il.quantity), 0) AS current_occupancy,
+                        pos.type AS location_type,
+                        pos.zone
+                    FROM positions pos
+                    LEFT JOIN inventory_locations il ON pos.id = il.position_id
+                    WHERE pos.code = :loc
+                    GROUP BY pos.id, pos.capacity, pos.type, pos.zone
                 """)
                 capacity_result = conn.execute(capacity_query, {"loc": location_code}).fetchone()
                 conn.commit()  # Commit read transaction

@@ -11,6 +11,7 @@ from langgraph.prebuilt import ToolNode
 from ..models.base import BaseAgent, AgentState
 from ..config import settings
 from .tools import EnhancedWMSTools
+from .policy_engine import DeterministicPolicyEngine
 
 
 class WMSAgent(BaseAgent):
@@ -25,29 +26,7 @@ class WMSAgent(BaseAgent):
         self.enhanced_tools = EnhancedWMSTools()
         
         # Setup tools - use all operational tools
-        self.tools = [
-            # Analytical Tools
-            self.enhanced_tools.enhanced_inventory_query,
-            self.enhanced_tools.abc_analysis_report,
-            self.enhanced_tools.smart_slotting_optimizer,
-            
-            # Inventory Transaction Tools
-            self.enhanced_tools.update_inventory_quantity,
-            self.enhanced_tools.adjust_inventory_for_reason,
-            
-            # Inbound/Outbound Tools
-            self.enhanced_tools.move_stock_between_locations,
-            
-            # Logs & System Tools
-            self.enhanced_tools.get_transaction_history,
-            self.enhanced_tools.get_stock_movement_history,
-            self.enhanced_tools.get_user_activity_summary,
-            self.enhanced_tools.create_system_alert,
-            
-            # Enhanced Operational Tools
-            self.enhanced_tools.get_low_stock_report,
-            self.enhanced_tools.verify_location_empty
-        ]
+        self.tools = self.enhanced_tools.get_tools()
         self.llm_with_tools = self.llm.bind_tools(self.tools)
         
         # Build workflow
@@ -59,8 +38,15 @@ class WMSAgent(BaseAgent):
         """Build the agent workflow graph"""
         
         def call_model(state: AgentState):
-            """Agent reasoning node"""
-            messages = state["messages"]
+            """Agent reasoning node with SOX/GAAP guardrails system prompt"""
+            system_prompt = (
+                "You are an AI assistant for WMS (Warehouse Management System). "
+                "MAKER-CHECKER SECURITY GUARDRAIL ENFORCED: You CANNOT modify inventory quantity or move stock directly in the database. "
+                "Any inventory update or stock movement request will generate a DraftAdjustmentProposal or DraftMovementProposal "
+                "which must be reviewed and confirmed by a human Warehouse Manager before actual stock levels change."
+            )
+            from langchain_core.messages import SystemMessage
+            messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
             response = self.llm_with_tools.invoke(messages)
             return {"messages": [response]}
         
@@ -85,8 +71,13 @@ class WMSAgent(BaseAgent):
         
         return workflow
     
-    def process(self, question: str) -> str:
-        """Process question using agent capabilities"""
+    def process(self, question: str, user_id: str = "authenticated_user") -> str:
+        """Process question using agent capabilities with deterministic guardrails"""
+        # 1. Deterministic Hard Policy Engine Gate
+        policy_eval = DeterministicPolicyEngine.evaluate(question)
+        if policy_eval.get("is_violation"):
+            return policy_eval.get("message", "Request rejected by policy engine.")
+
         messages = [HumanMessage(content=question)]
         
         try:

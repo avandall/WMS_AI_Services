@@ -7,7 +7,10 @@ from typing import List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.documents import Document as LangchainDocument
-import bs4
+try:
+    import bs4
+except ImportError:
+    bs4 = None
 from ai_engine.models.base import Document
 
 

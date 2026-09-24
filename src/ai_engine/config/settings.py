@@ -21,7 +21,11 @@ class Settings:
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     EMBEDDING_DEVICE: str = os.getenv("EMBEDDING_DEVICE", "cpu")
     
-    # Database Configuration
+    # Database & Vector DB Configuration
+    VECTOR_STORE_TYPE: str = os.getenv("VECTOR_STORE_TYPE", "qdrant")
+    QDRANT_URL: str = os.getenv("QDRANT_URL", "http://localhost:6333")
+    QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")
+    QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "wms_knowledge")
     VECTOR_DB_PATH: str = os.getenv("VECTOR_DB_PATH", "./vector_db")
     DB_CONNECTION_STRING: str = os.getenv("DB_CONNECTION_STRING", "")
     
