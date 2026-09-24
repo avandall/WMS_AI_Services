@@ -11,7 +11,10 @@ try:
     import bs4
 except ImportError:
     bs4 = None
-from ai_engine.models.base import Document
+try:
+    from ..models.base import Document
+except (ImportError, ValueError):
+    from ai_engine.models.base import Document
 
 
 class DocumentProcessor:

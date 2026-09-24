@@ -44,6 +44,20 @@ class Settings:
     FINE_TUNED_MODEL_PATH: str = os.getenv("FINE_TUNED_MODEL_PATH", "").strip()
     FINE_TUNED_MODEL_DEVICE: str = os.getenv("FINE_TUNED_MODEL_DEVICE", "cpu").strip()
     FINE_TUNED_MAX_NEW_TOKENS: int = int(os.getenv("FINE_TUNED_MAX_NEW_TOKENS", "256"))
+
+    # Security & Audit Configuration (SOX Compliance / Twelve-Factor App)
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).lower()
+    DEFAULT_DEV_HMAC_SECRET: str = "dev_hmac_secret_key_change_in_prod"
+    _raw_hmac_secret: str = os.getenv("WMS_PROPOSAL_HMAC_SECRET", "").strip()
+
+    if not _raw_hmac_secret:
+        if ENVIRONMENT == "production":
+            raise RuntimeError("WMS_PROPOSAL_HMAC_SECRET is required in production environment")
+        WMS_PROPOSAL_HMAC_SECRET: str = DEFAULT_DEV_HMAC_SECRET
+    elif ENVIRONMENT == "production" and (_raw_hmac_secret == DEFAULT_DEV_HMAC_SECRET or _raw_hmac_secret == "replace-with-hmac-secret-in-prod"):
+        raise RuntimeError("WMS_PROPOSAL_HMAC_SECRET is required in production environment")
+    else:
+        WMS_PROPOSAL_HMAC_SECRET: str = _raw_hmac_secret
     
     @classmethod
     def get_llm_config(cls) -> Dict[str, Any]:

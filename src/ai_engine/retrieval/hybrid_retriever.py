@@ -9,7 +9,13 @@ from qdrant_client.http.models import Distance, VectorParams
 from langchain_qdrant import QdrantVectorStore
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.retrievers import BM25Retriever
-from langchain_classic.retrievers import EnsembleRetriever
+try:
+    from langchain_community.retrievers import EnsembleRetriever
+except ImportError:
+    try:
+        from langchain.retrievers import EnsembleRetriever
+    except ImportError:
+        from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.documents import Document as LangchainDocument
 
 from ..models.base import BaseRetriever, Document
