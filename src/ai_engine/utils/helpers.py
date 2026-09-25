@@ -45,11 +45,12 @@ def validate_api_keys() -> Dict[str, bool]:
 
 
 def sanitize_text(text: str) -> str:
-    """Sanitize text for processing"""
+    """Sanitize text for processing while preserving measurement notations like inch (\")."""
     # Remove excessive whitespace
     text = ' '.join(text.split())
-    # Remove potentially harmful characters (basic sanitization)
-    dangerous_chars = ['<', '>', '&', '"', "'"]
+    # Remove potentially harmful characters (basic sanitization: HTML tags/brackets)
+    # Quotes (' and ") are preserved to support product specs (e.g., 15" Laptop, O'Reilly)
+    dangerous_chars = ['<', '>', '&']
     for char in dangerous_chars:
         text = text.replace(char, '')
     return text
