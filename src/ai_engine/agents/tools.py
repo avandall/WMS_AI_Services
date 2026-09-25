@@ -240,7 +240,79 @@ class EnhancedWMSTools:
                 return match.group(1).upper()
         
         return None
-    
+
+    def _create_draft_proposal_grpc(
+        self,
+        proposal_id: str,
+        proposal_type: str,
+        sku_code: str,
+        adjustment: int,
+        reason: str,
+        user_id: str = "system",
+        warehouse_id: int = 1,
+        location_code: str = "",
+        current_quantity: int = 0,
+        proposed_quantity: int = 0,
+        digital_signature: str = "",
+        stub: Any = None,
+    ) -> bool:
+        """
+        Dispatch draft proposal creation to WMS Core InventoryService via gRPC (TASK-087 / TECH-02).
+        Enforces Clean Architecture: No direct database writes to draft_proposals table from AI Service.
+        Triggers Soft Quarantine (PENDING_ADJUSTMENT) in Core Inventory domain.
+        """
+        try:
+            from ai_service.gen.wms.inventory.v1 import inventory_pb2, inventory_pb2_grpc
+        except ImportError:
+            try:
+                import sys
+                from pathlib import Path
+                gen_dir = Path(__file__).resolve().parent.parent.parent / "ai_service" / "gen"
+                if str(gen_dir) not in sys.path:
+                    sys.path.insert(0, str(gen_dir))
+                from wms.inventory.v1 import inventory_pb2, inventory_pb2_grpc
+            except Exception as e:
+                logger.warning(f"Could not import inventory proto for gRPC proposal: {e}")
+                return False
+
+        req = inventory_pb2.CreateDraftProposalRequest(
+            proposal_id=proposal_id,
+            proposal_type=proposal_type,
+            sku_code=sku_code,
+            warehouse_id=warehouse_id,
+            location_code=location_code,
+            current_quantity=current_quantity,
+            proposed_quantity=proposed_quantity,
+            adjustment=adjustment,
+            reason=reason,
+            requested_by=user_id,
+            digital_signature=digital_signature,
+        )
+
+        active_stub = stub or getattr(self, "inventory_grpc_stub", None)
+        if active_stub is not None:
+            try:
+                resp = active_stub.CreateDraftProposal(req)
+                return getattr(resp, "success", True)
+            except Exception as e:
+                logger.warning(f"Injected gRPC stub failed: {e}")
+                return False
+
+        import grpc
+        grpc_host = os.getenv("INVENTORY_GRPC_HOST", "localhost")
+        grpc_port = os.getenv("INVENTORY_GRPC_PORT", "50052")
+        target = f"{grpc_host}:{grpc_port}"
+
+        try:
+            with grpc.insecure_channel(target) as channel:
+                inv_stub = inventory_pb2_grpc.InventoryServiceStub(channel)
+                resp = inv_stub.CreateDraftProposal(req, timeout=5.0)
+                logger.info(f"gRPC CreateDraftProposal succeeded for {proposal_id}: {resp.message}")
+                return resp.success
+        except Exception as e:
+            logger.warning(f"gRPC CreateDraftProposal call to {target} failed for {proposal_id}: {e}")
+            return False
+
     def _get_inventory_data(self, sku_code: str) -> Dict[str, Any]:
         """Get inventory data from database aligned with WMS Core schema"""
         try:
@@ -753,32 +825,24 @@ class EnhancedWMSTools:
             current_quantity = current_data["quantity"] if current_data else 0
             quantity_change = new_quantity - current_quantity
             proposal_id = f"PROP_{sku_code}_{int(time.time())}"
-            
-            # Record draft proposal in database if connection is available
-            if self.engine:
-                try:
-                    with self.engine.connect() as conn:
-                        log_proposal = text("""
-                            INSERT INTO draft_proposals 
-                            (proposal_id, proposal_type, sku_code, current_quantity, proposed_quantity, adjustment, reason, requested_by, status, created_at)
-                            VALUES (:pid, 'DraftAdjustmentProposal', :sku, :curr_qty, :prop_qty, :adj, :reason, :user_id, 'DRAFT_PROPOSAL', CURRENT_TIMESTAMP)
-                        """)
-                        conn.execute(log_proposal, {
-                            "pid": proposal_id,
-                            "sku": sku_code,
-                            "curr_qty": current_quantity,
-                            "prop_qty": new_quantity,
-                            "adj": quantity_change,
-                            "reason": reason,
-                            "user_id": user_id
-                        })
-                        conn.commit()
-                except Exception as db_err:
-                    logger.warning(f"Could not persist draft proposal to DB table: {db_err}")
-            
             sig_payload = f"{proposal_id}:{sku_code}:{current_quantity}:{new_quantity}:{user_id}"
             hmac_secret = (getattr(settings, "WMS_PROPOSAL_HMAC_SECRET", None) or os.getenv("WMS_PROPOSAL_HMAC_SECRET", "dev_hmac_secret_key_change_in_prod")).encode("utf-8")
             digital_sig = hmac.new(hmac_secret, sig_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+            # Call WMS Core inventory-service via gRPC CreateDraftProposal (TASK-087 / TECH-02)
+            grpc_success = self._create_draft_proposal_grpc(
+                proposal_id=proposal_id,
+                proposal_type="DraftAdjustmentProposal",
+                sku_code=sku_code,
+                adjustment=quantity_change,
+                reason=reason,
+                user_id=user_id,
+                warehouse_id=int(current_data.get("warehouse_id", 1)) if current_data and current_data.get("warehouse_id") else 1,
+                location_code=str(current_data.get("location", "")) if current_data and current_data.get("location") else "",
+                current_quantity=current_quantity,
+                proposed_quantity=new_quantity,
+                digital_signature=digital_sig,
+            )
 
             return {
                 "success": True,
@@ -853,7 +917,7 @@ class EnhancedWMSTools:
     
     # ==================== INBOUND/OUTBOUND OPERATIONS ====================
     
-    def move_stock_between_locations(self, sku_code: str, from_location: str, to_location: str, quantity: int, user_id: str = "system"):
+    def move_stock_between_locations(self, sku_code: str, from_location: str, to_location: str, quantity: int, user_id: str = "system", reason: str = ""):
         """
         Propose moving stock from one warehouse location to another (Maker-Checker Guardrail).
         Creates a DraftMovementProposal requiring human approval before stock is transferred.
@@ -864,6 +928,7 @@ class EnhancedWMSTools:
             to_location: Destination location code (e.g., "Zone B-02-03")
             quantity: Quantity to move
             user_id: User/agent proposing the move
+            reason: Optional justification for the movement
         
         Returns movement proposal details requiring human approval.
         
@@ -890,31 +955,25 @@ class EnhancedWMSTools:
                 }
             
             proposal_id = f"MOVE_PROP_{sku_code}_{int(time.time())}"
-            
-            if self.engine:
-                try:
-                    with self.engine.connect() as conn:
-                        log_proposal = text("""
-                            INSERT INTO draft_proposals 
-                            (proposal_id, proposal_type, sku_code, current_quantity, proposed_quantity, adjustment, reason, requested_by, status, created_at)
-                            VALUES (:pid, 'DraftMovementProposal', :sku, :curr_qty, :prop_qty, :adj, :reason, :user_id, 'DRAFT_PROPOSAL', CURRENT_TIMESTAMP)
-                        """)
-                        conn.execute(log_proposal, {
-                            "pid": proposal_id,
-                            "sku": sku_code,
-                            "curr_qty": source_stock,
-                            "prop_qty": source_stock - quantity,
-                            "adj": -quantity,
-                            "reason": f"Move {quantity} units from {from_location} to {to_location}",
-                            "user_id": user_id
-                        })
-                        conn.commit()
-                except Exception as db_err:
-                    logger.warning(f"Could not persist draft proposal to DB table: {db_err}")
-            
             sig_payload = f"{proposal_id}:{sku_code}:{from_location}:{to_location}:{quantity}:{user_id}"
             hmac_secret = (getattr(settings, "WMS_PROPOSAL_HMAC_SECRET", None) or os.getenv("WMS_PROPOSAL_HMAC_SECRET", "dev_hmac_secret_key_change_in_prod")).encode("utf-8")
             digital_sig = hmac.new(hmac_secret, sig_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+            # Call WMS Core inventory-service via gRPC CreateDraftProposal (TASK-087 / TECH-02)
+            move_reason = reason or f"Move {quantity} units from {from_location} to {to_location}"
+            grpc_success = self._create_draft_proposal_grpc(
+                proposal_id=proposal_id,
+                proposal_type="DraftMovementProposal",
+                sku_code=sku_code,
+                adjustment=-quantity,
+                reason=move_reason,
+                user_id=user_id,
+                warehouse_id=1,
+                location_code=from_location,
+                current_quantity=source_stock,
+                proposed_quantity=source_stock - quantity,
+                digital_signature=digital_sig,
+            )
 
             return {
                 "success": True,
