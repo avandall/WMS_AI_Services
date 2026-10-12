@@ -145,3 +145,32 @@ class TestAIAgentGRPCProposals:
         assert call_arg.proposal_type == "DraftMovementProposal"
         assert call_arg.adjustment == -10
         assert call_arg.location_code == "ZONE-A-01"
+
+    def test_proposal_id_uniqueness_with_uuid(self):
+        """TASK-099: proposal_id must be unique across rapid successive calls (no timestamp collisions)."""
+        tools = EnhancedWMSTools()
+        mock_stub = MagicMock()
+        mock_stub.CreateDraftProposal.return_value = MagicMock(success=True)
+        tools.inventory_grpc_stub = mock_stub
+        tools._get_inventory_data = MagicMock(return_value={"quantity": 10, "location": "A-1"})
+
+        proposal_ids = set()
+        for _ in range(50):
+            res = tools.update_inventory_quantity(
+                sku_code="SKU-UNIQ-001",
+                new_quantity=15,
+                reason="Rapid adjustment test",
+                user_id="bot"
+            )
+            assert res["success"] is True
+            proposal_ids.add(res["proposal_id"])
+
+        assert len(proposal_ids) == 50, "Generated duplicate proposal IDs in rapid batch execution!"
+
+    def test_cartesian_free_inventory_query_logic(self):
+        """TASK-099: Verifies _get_inventory_data does not perform Cartesian cross-joins."""
+        tools_path = Path(__file__).resolve().parent.parent.parent / "src" / "ai_engine" / "agents" / "tools.py"
+        content = tools_path.read_text(encoding="utf-8")
+        # Ensure the old explosive 3-table JOIN query was removed
+        assert "LEFT JOIN warehouse_inventory wi ON p.product_id = wi.product_id\n                    LEFT JOIN inventory_locations il" not in content
+

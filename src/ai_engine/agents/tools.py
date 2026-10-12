@@ -10,6 +10,7 @@ import pandas as pd
 from langchain_core.tools import tool
 from datetime import datetime, timedelta, timezone
 import time
+import uuid
 
 from ..config import settings
 from ..utils import logger
@@ -314,42 +315,60 @@ class EnhancedWMSTools:
             return False
 
     def _get_inventory_data(self, sku_code: str) -> Dict[str, Any]:
-        """Get inventory data from database aligned with WMS Core schema"""
+        """Get inventory data from database aligned with WMS Core schema without Cartesian fan-out (TASK-099)."""
         try:
             if not self.engine:
                 raise Exception("Database engine not initialized")
             
             with self.engine.connect() as conn:
-                query = text("""
-                    SELECT 
-                        p.name AS product_name,
-                        COALESCE(SUM(wi.physical_qty), SUM(wi.quantity), 0) AS quantity,
-                        COALESCE(MIN(pos.code), 'UNKNOWN') AS location,
-                        MAX(il.updated_at) AS last_updated,
-                        MAX(p.price) AS unit_cost,
-                        p.product_id
-                    FROM products p
-                    LEFT JOIN warehouse_inventory wi ON p.product_id = wi.product_id
-                    LEFT JOIN inventory_locations il ON p.product_id = il.product_id
-                    LEFT JOIN positions pos ON il.position_id = pos.id
-                    WHERE p.name = :sku OR CAST(p.product_id AS VARCHAR) = :sku
-                    GROUP BY p.product_id, p.name
+                # 1. Query product details
+                prod_query = text("""
+                    SELECT product_id, name, price
+                    FROM products
+                    WHERE name = :sku OR CAST(product_id AS VARCHAR) = :sku
+                    LIMIT 1
                 """)
-                result = conn.execute(query, {"sku": sku_code}).fetchone()
-                
-                if result:
-                    return {
-                        "sku": sku_code,
-                        "quantity": int(result[1]) if result[1] is not None else 0,
-                        "location": result[2] or "UNKNOWN",
-                        "product_name": result[0],
-                        "last_updated": result[3].isoformat() if hasattr(result[3], "isoformat") else str(result[3]) if result[3] else None,
-                        "unit_cost": float(result[4]) if result[4] else 0.0,
-                        "reorder_point": 0,
-                        "safety_stock": 0
-                    }
-                
-                return None
+                prod = conn.execute(prod_query, {"sku": sku_code}).fetchone()
+                if not prod:
+                    return None
+
+                product_id, product_name, price = prod[0], prod[1], prod[2]
+
+                # 2. Query total inventory from warehouse_inventory without multi-table join Cartesian explosion
+                inv_query = text("""
+                    SELECT COALESCE(SUM(physical_qty), SUM(quantity), 0)
+                    FROM warehouse_inventory
+                    WHERE product_id = :pid
+                """)
+                inv_res = conn.execute(inv_query, {"pid": product_id}).fetchone()
+                quantity = int(inv_res[0]) if inv_res and inv_res[0] is not None else 0
+
+                # 3. Query primary location code and last updated timestamp from inventory_locations
+                loc_query = text("""
+                    SELECT 
+                        COALESCE(pos.code, 'UNKNOWN') AS location,
+                        il.updated_at
+                    FROM inventory_locations il
+                    LEFT JOIN positions pos ON il.position_id = pos.id
+                    WHERE il.product_id = :pid AND il.quantity > 0
+                    ORDER BY il.quantity DESC, il.updated_at DESC
+                    LIMIT 1
+                """)
+                loc_res = conn.execute(loc_query, {"pid": product_id}).fetchone()
+                location = loc_res[0] if loc_res and loc_res[0] else "UNKNOWN"
+                last_updated = loc_res[1].isoformat() if loc_res and loc_res[1] and hasattr(loc_res[1], "isoformat") else str(loc_res[1]) if loc_res and loc_res[1] else None
+
+                return {
+                    "sku": sku_code,
+                    "quantity": quantity,
+                    "location": location,
+                    "product_name": product_name,
+                    "last_updated": last_updated,
+                    "unit_cost": float(price) if price else 0.0,
+                    "reorder_point": 0,
+                    "safety_stock": 0,
+                    "product_id": product_id,
+                }
                 
         except Exception as e:
             logger.error(f"Database error: {str(e)}")
@@ -824,7 +843,7 @@ class EnhancedWMSTools:
             current_data = self._get_inventory_data(sku_code)
             current_quantity = current_data["quantity"] if current_data else 0
             quantity_change = new_quantity - current_quantity
-            proposal_id = f"PROP_{sku_code}_{int(time.time())}"
+            proposal_id = f"PROP_{sku_code}_{uuid.uuid4().hex[:12]}"
             sig_payload = f"{proposal_id}:{sku_code}:{current_quantity}:{new_quantity}:{user_id}"
             hmac_secret = (getattr(settings, "WMS_PROPOSAL_HMAC_SECRET", None) or os.getenv("WMS_PROPOSAL_HMAC_SECRET", "dev_hmac_secret_key_change_in_prod")).encode("utf-8")
             digital_sig = hmac.new(hmac_secret, sig_payload.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -954,7 +973,7 @@ class EnhancedWMSTools:
                     "suggestion": "Check stock levels or reduce quantity"
                 }
             
-            proposal_id = f"MOVE_PROP_{sku_code}_{int(time.time())}"
+            proposal_id = f"MOVE_PROP_{sku_code}_{uuid.uuid4().hex[:12]}"
             sig_payload = f"{proposal_id}:{sku_code}:{from_location}:{to_location}:{quantity}:{user_id}"
             hmac_secret = (getattr(settings, "WMS_PROPOSAL_HMAC_SECRET", None) or os.getenv("WMS_PROPOSAL_HMAC_SECRET", "dev_hmac_secret_key_change_in_prod")).encode("utf-8")
             digital_sig = hmac.new(hmac_secret, sig_payload.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -1289,7 +1308,7 @@ class EnhancedWMSTools:
             if not self.engine:
                 raise Exception("Database engine not initialized")
             
-            alert_id = f"ALERT_{int(time.time())}"
+            alert_id = f"ALERT_{uuid.uuid4().hex[:12]}"
             
             with self.engine.connect() as conn:
                 query = text("""
