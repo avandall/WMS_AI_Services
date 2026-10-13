@@ -1,4 +1,0 @@
-[submodule "Libraries/shared-utils"]
-	path = Libraries/shared-utils
-	url = https://github.com/avandall/shared-utils.git
-

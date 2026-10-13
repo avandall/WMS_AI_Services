@@ -46,4 +46,5 @@ packages = ["src/ai_service", "src/ai_engine"]
 packages = ["src/ai_service", "src/ai_engine"]
 
 [tool.uv.sources]
-shared-utils = { path = "./Libraries/shared-utils" }
+shared-utils = { git = "https://github.com/avandall/shared-utils.git", branch = "master" }
+
